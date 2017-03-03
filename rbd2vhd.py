@@ -1,4 +1,4 @@
-#!/usr/bin/python
+#!/usr/bin/python -u
 #
 # Copyright (C) Roman V. Posudnevskiy (ramzes_r@yahoo.com)
 #
@@ -15,17 +15,20 @@
 # along with this program; if not, write to the Free Software Foundation, Inc.,
 # 51 Franklin Street, Fifth math.floor, Boston, MA  02110-1301  USA
 
+from __future__ import print_function
 from struct import *
 import uuid
 import sys, getopt
 import re
 import time
-#import ctypes
 
 SECTOR_SIZE = 512
 VHD_DEFAULT_BLOCK_SIZE = 2097152
 VHD_DYNAMIC_HARDDISK_TYPE = 0x00000003# Dynamic hard disk
 VHD_DIFF_HARDDISK_TYPE = 0x00000004# Differencing hard disk
+
+VDI_PREFIX = "VHD-"
+SNAPSHOT_PREFIX = "SNAP-"
 
 #-- VHD FOOTTER FIELDs --#
 _vhd_footter_cookie_                 = 0
@@ -43,6 +46,7 @@ _vhd_footter_disk_type_              = 11
 _vhd_footter_checksum_               = 12
 _vhd_footter_unique_iq_              = 13
 _vhd_footter_saved_state_            = 14
+_vhd_footter_rbd_image_uuid_         = 15
 #-- VHD FOOTTER FIELDs --#
 
 #-- VHD DISK GEOMETRY FIELs --#
@@ -105,7 +109,7 @@ _platform_code_Mac_     = 0x4D616320
 _platform_code_MacX_    = 0x4D616358
 #-- PLATFORM CODEs --#
 
-VHD_FOTTER_FORMAT = "!8sIIQI4sIIQQ4sII16sB427s"
+VHD_FOTTER_FORMAT = "!8sIIQI4sIIQQ4sII16sB16s411s"
 VHD_FOTTER_RECORD_SIZE = 512
 VHD_DISK_GEOMETRY_FORMAT = "!HBB"
 VHD_DISK_GEOMETRY_RECORD_SIZE = 4
@@ -113,145 +117,40 @@ VHD_DYNAMIC_DISK_HEADER_FORMAT = "!8sQQIIII16sII512s24s24s24s24s24s24s24s24s256s
 VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE = 1024
 VHD_PARENT_LOCATOR_ENTRY_FORMAT = "!IIIIQ"
 VHD_PARENT_LOCATOR_ENTRY_RECORD_SIZE = 24
-VHD_BATMAP_HEADER_FORMAT = "!8sQIIIB"
-VHD_BATMAP_HEADER_SIZE = 29
+VHD_PARENT_LOCATORS_COUNT = 9
+VHD_BATMAP_HEADER_FORMAT = "!8sQIIIB483s"
+VHD_BATMAP_HEADER_SIZE = 512
 
 #-- RBD DIFF v1 META AND DATA FIELDs --#
 RBD_HEADER = "rbd diff v1\n"
-RBD_DIFF_RECORD_TAG = "!c"
+RBD_DIFF_META_ENDIAN_PREFIX = "<"#bigendian ! or littleendian <
+RBD_DIFF_META_RECORD_TAG = "c"
+RBD_DIFF_META_RECORD_TAG_SIZE = 1
 RBD_DIFF_META_SNAP = "I"
+RBD_DIFF_META_SNAP_SIZE = 4
 RBD_DIFF_META_SIZE = "Q"
+RBD_DIFF_META_SIZE_SIZE = 8
 RBD_DIFF_DATA = "QQ"
+RBD_DIFF_DATA_SIZE = 16
 #-- RBD DIFF v1 META AND DATA FIELDs --#
+#-------------------------------------------------------------------------------------------------------------------------------------------------------#
+def eprint(*args, **kwargs):
+    print(*args, file=sys.stderr, **kwargs)
 
-def get_size_aligned_to_sector_boundary(size):
-    if size%512>0:
-        aligned_size = ((bitmap_size//512)+1)*512
+def INFO(v, string):
+    if v is True:
+        eprint("[INFO]%s" % string)
+
+def ERROR(v, string):
+    if v is not True:
+        eprint("[ERROR]%s" % string)
     else:
-        aligned_size = size
-    return aligned_size
+        eprint("[ERROR]%s" % string)
+        
+def modTupleByIndex(tup, index, ins):
+    return tuple(tup[0:index]) + (ins,) + tuple(tup[index+1:])
 
-def get_vhd_footer_b(vhdfile):
-    vhdfile.seek(0, 0)
-    _buffer_ = vhdfile.read(VHD_FOTTER_RECORD_SIZE)
-    return unpack(VHD_FOTTER_FORMAT, _buffer_)
-
-def get_vhd_footer_e(vhdfile):
-    vhdfile.seek(-get_size_aligned_to_sector_boundary(VHD_FOTTER_RECORD_SIZE), 2)
-    _buffer_ = vhdfile.read(VHD_FOTTER_RECORD_SIZE)
-    return unpack(VHD_FOTTER_FORMAT, _buffer_)
-
-def get_vhd_batmap(vhdfile, dynamic_disk_header):
-    vhdfile.seek(get_size_aligned_to_sector_boundary(VHD_FOTTER_RECORD_SIZE + VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE + dynamic_disk_header[_dynamic_disk_header_max_table_entries_]*4), 0)
-    _buffer_ = vhdfile.read(VHD_BATMAP_HEADER_SIZE)
-    return unpack(VHD_BATMAP_HEADER_FORMAT, _buffer_)    
-
-def get_dynamic_disk_header(vhdfile):
-    vhdfile.seek(get_size_aligned_to_sector_boundary(VHD_FOTTER_RECORD_SIZE), 0)
-    _buffer_ = vhdfile.read(VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE)
-    return unpack(VHD_DYNAMIC_DISK_HEADER_FORMAT, _buffer_)
-
-def get_parent_locator(vhdfile, parent_locator_entry):
-    vhdfile.seek(parent_locator_entry[_parent_locator_platform_data_offset_], 0)
-    _buffer_ = vhdfile.read(parent_locator_entry[_parent_locator_platform_data_length_])
-    return unpack("!%ds" % parent_locator_entry[_parent_locator_platform_data_length_], _buffer_)
-
-def print_vhd_batmap(batmap):
-    print("------------------ BATMAP -----------------------------------------")
-    print("VHD BATMAP: Cookie = %s" % batmap[_batmap_cookie_])
-    print("VHD BATMAP: Offset = 0x%016x" % batmap[_batmap_offset_])
-    print("VHD BATMAP: Size = %d" % batmap[_batmap_size_])
-    print("VHD BATMAP: Version = 0x%08x" % batmap[_batmap_version_])
-    print("VHD BATMAP: Checksum = 0x%08x" % batmap[_batmap_checksum_])
-    print("VHD BATMAP: Marker = 0x%02x" % batmap[_batmap_marker_])
-    print("-------------------------------------------------------------------")
-
-def print_dynamic_disk_header(vhdfile, dynamic_disk_header):
-    print("------------------ DYNAMIC DISK HEADER -----------------------------------------")
-    print("VHD DYNAMIC DISK HEADER: Cookie = %s" % dynamic_disk_header[_dynamic_disk_header_cookie_])
-    print("VHD DYNAMIC DISK HEADER: Data Offset = 0x%016x" % dynamic_disk_header[_dynamic_disk_header_data_offset_])
-    print("VHD DYNAMIC DISK HEADER: Table Offset = 0x%016x" % dynamic_disk_header[_dynamic_disk_header_table_offset_])
-    print("VHD DYNAMIC DISK HEADER: Header version = 0x%08x" % dynamic_disk_header[_dynamic_disk_header_header_version_])
-    print("VHD DYNAMIC DISK HEADER: Max Table Entries = 0x%08x" % dynamic_disk_header[_dynamic_disk_header_max_table_entries_])
-    print("VHD DYNAMIC DISK HEADER: Block Size = 0x%08x" % dynamic_disk_header[_dynamic_disk_header_block_size_])
-    print("VHD DYNAMIC DISK HEADER: Checksum = 0x%08x" % dynamic_disk_header[_dynamic_disk_header_checksum_])
-    print("VHD DYNAMIC DISK HEADER: Parent Unique ID = %s" % uuid.UUID(bytes=dynamic_disk_header[_dynamic_disk_header_parent_unique_id_]))
-    print("VHD DYNAMIC DISK HEADER: Timestamp = 0x%08x" % dynamic_disk_header[_dynamic_disk_header_parent_time_stamp_])
-    print("VHD DYNAMIC DISK HEADER: Parent Unicode Name = %s" % dynamic_disk_header[_dynamic_disk_header_parent_unicode_name_])
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_1_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 1 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 1 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_2_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 2 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 2 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_3_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 3 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 3 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_4_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 4 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 4 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_5_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 5 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 5 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_6_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 6 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 6 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_7_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 7 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 7 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    parent_locator_entry = unpack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, dynamic_disk_header[_dynamic_disk_header_parent_locator_entry_8_])
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 8 ( Platform Code = 0x%08x, Platform Data Space = %i, Platform Data Length = %i, Platform Data Offset = 0x%016x ) " % (parent_locator_entry[_parent_locator_platform_code_],parent_locator_entry[_parent_locator_platform_data_space_],parent_locator_entry[_parent_locator_platform_data_length_],parent_locator_entry[_parent_locator_platform_data_offset_]))
-    print("VHD DYNAMIC DISK HEADER: Parent Locator Entry 8 = \'%s\'" % get_parent_locator(vhdfile, parent_locator_entry))
-    #print(dynamic_disk_header)
-    print("--------------------------------------------------------------------------------")
-
-def print_vhd_footer(vhd_footer):
-    print("------------------ VHD FOOTER-----------------------------------------")
-    print("VHD FOOTER: Cookie = %s" % vhd_footer[_vhd_footter_cookie_])
-    print("VHD FOOTER: Features = 0x%08x" % vhd_footer[_vhd_footter_features_])
-    print("VHD FOOTER: File Format Version = 0x%08x" % vhd_footer[_vhd_footter_file_format_version_])
-    print("VHD FOOTER: Data Offset = 0x%08x" % vhd_footer[_vhd_footter_data_offset_])
-    print("VHD FOOTER: Timestamp = 0x%08x" % vhd_footer[_vhd_footter_time_stamp_])
-    print("VHD FOOTER: Creator Application = %s" % vhd_footer[_vhd_footter_creator_application_])
-    print("VHD FOOTER: Creator Version = 0x%08x" % vhd_footer[_vhd_footter_creator_version_])
-    print("VHD FOOTER: Creator Host OS = 0x%08x" % vhd_footer[_vhd_footter_creator_host_os_])
-    print("VHD FOOTER: Original Size = %i" % vhd_footer[_vhd_footter_original_size_])
-    print("VHD FOOTER: Current Size = %i" % vhd_footer[_vhd_footter_current_size_])
-    vhd_disk_geometry = unpack(VHD_DISK_GEOMETRY_FORMAT, vhd_footer[_vhd_footter_disk_geometry_])
-    print("VHD FOOTER: Disk Geometry (Cylinders = %i, Heads = %i, Sectors per cylinder = %s)" % (vhd_disk_geometry[_vhd_disk_geometry_cylinders_],vhd_disk_geometry[_vhd_disk_geometry_heads_],vhd_disk_geometry[_vhd_disk_geometry_sectors_per_cylinder_]))
-    print("VHD FOOTER: Disk Type = 0x%08x" % vhd_footer[_vhd_footter_disk_type_])
-    print("VHD FOOTER: Checksum = 0x%08x" % vhd_footer[_vhd_footter_checksum_])
-    print("VHD FOOTER: Unique ID = %s" % uuid.UUID(bytes=vhd_footer[_vhd_footter_unique_iq_]))
-    print("VHD FOOTER: Saved State = 0x%02x" % vhd_footer[_vhd_footter_saved_state_])
-    #print(vhd_footer)
-    print("----------------------------------------------------------------------")
-
-def gen_vhd_footer_struct(disk_type, image_size, uuid, checksum):
-    disk_geometry_struct = gen_disk_geometry(image_size)
-    disk_geometry = pack(VHD_DISK_GEOMETRY_FORMAT, disk_geometry_struct[0], disk_geometry_struct[1], disk_geometry_struct[2])
-    reserved = ''
-    for i in range(427):
-        reserved = reserved + pack('!c', chr(0))
-    footer_struct = ('conectix', 0x00000002, 0x00010000, 0x00000200, time.time(), 'tap', 0x00010003, 0x00000000, image_size, image_size, disk_geometry, disk_type, checksum, uuid, 0, reserved)
-    return footer_struct
-
-def gen_vhd_dynamic_disk_header_struct(table_offset, image_size, checksum, parent_uuid, parent_unicode_name):
-    max_tab_entries = image_size / VHD_DEFAULT_BLOCK_SIZE
-    reserved = ''
-    for i in range(256):
-        reserved = reserved + pack('!c', chr(0))
-    parent_locator_entry_1_struct = (0x4d616358, 512, 49, 0, 0x0000000000005c00) #MacX
-    parent_locator_entry_1 = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_1_struct)
-    parent_locator_entry_2_struct = (0x57326b75, 512, 84, 0, 0x0000000000005e00) #W2ku
-    parent_locator_entry_2 = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_2_struct)
-    parent_locator_entry_3_struct = (0x57327275, 512, 84, 0, 0x0000000000006000) #W2ru
-    parent_locator_entry_3 = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_3_struct)
-    parent_locator_entry_empty_struct = (0x00000000, 0, 0, 0, 0) #empty
-    parent_locator_entry_empty = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_empty_struct)
-    header_struct = ('cxsparse', 0xffffffffffffffff, table_offset, 0x00010000, max_tab_entries, VHD_DEFAULT_BLOCK_SIZE, checksum, parent_uuid, time.time(), 0x00000000, parent_unicode_name, parent_locator_entry_1, parent_locator_entry_2, parent_locator_entry_3, parent_locator_entry_empty, parent_locator_entry_empty, parent_locator_entry_empty, parent_locator_entry_empty, parent_locator_entry_empty, reserved)
-    return header_struct
-
-def gen_vhd_checksum(vhd_record):
+def checksum(vhd_record):
     checksum = 0
     b = bytearray()
     b.extend(vhd_record)
@@ -259,8 +158,83 @@ def gen_vhd_checksum(vhd_record):
         checksum += b[index]
     checksum = ~checksum + 2**32
     return checksum
-    
-def gen_disk_geometry(image_size):
+
+def get_size_aligned_to_sector_boundary(size):
+    if size%SECTOR_SIZE>0:
+        aligned_size = ((size//SECTOR_SIZE)+1)*SECTOR_SIZE
+    else:
+        aligned_size = size
+    return aligned_size
+
+def get_bitmap_size(dynamic_disk_header):
+    sectors_in_block = dynamic_disk_header[_dynamic_disk_header_block_size_]/SECTOR_SIZE 
+    bitmap_size = sectors_in_block/8
+    return get_size_aligned_to_sector_boundary(bitmap_size)
+
+def gen_empty_bitarray_for_bitmap(bitmap_size):
+    bitarray = []
+    for bitmap_index in range(bitmap_size):
+        for bit_index in range(8):
+            bitarray.append(0)
+    return bitarray
+
+def gen_bitmap_from_bitarray(bitarray):
+    _bytearray_ = {}
+    bitmap = ''
+    for bitarray_index in range(len(bitarray)):
+        bit = 0
+        byte_index = bitarray_index//8
+        bit_in_byte = bitarray_index%8
+        if bitarray[bitarray_index] == 1:
+            bit = 128 >> bit_in_byte
+        if _bytearray_.has_key(byte_index):
+            _bytearray_[byte_index] = _bytearray_[byte_index] | bit
+        else:
+            _bytearray_[byte_index] = bit
+    for byte_index in range(len(_bytearray_)):
+        bitmap = bitmap + pack('!c', chr(_bytearray_[byte_index]))
+    return bitmap
+
+def get_bitarray_from_bitmap(bitmap, bitmap_size):
+    bitarray = []
+    _bitmap_ = bytearray()
+    _bitmap_.extend(bitmap)
+    for bitmap_index in range(bitmap_size):
+        for bit_index in range(8):
+            offset = 128 >> bit_index
+            if (_bitmap_[bitmap_index] & offset) > 0:
+                bitarray.append(1)
+            else:
+                bitarray.append(0)
+    return bitarray
+
+def gen_empty_vhd_bat(image_size):
+    bat_list = []
+    max_tab_entries = image_size / VHD_DEFAULT_BLOCK_SIZE
+    for bat_index in range(max_tab_entries):
+        bat_list.append(0xffffffff)
+    return bat_list
+
+def gen_empty_batmap():
+    return pack("!%ds" % (SECTOR_SIZE*2), '')
+
+def gen_batmap_header(batmap):
+    reserved = ''
+    for i in range(483):
+        reserved = reserved + pack('!c', chr(0))
+    batmap_header_struct = ('tdbatmap', 0, 0, 0x00010002, 0, 0, reserved) #empty
+    return batmap_header_struct
+
+def pack_vhd_bat(bat_list):
+    max_tab_entries = len(bat_list)
+    bat = ''
+    for bat_index in range(max_tab_entries):
+        bat = bat + pack("!I", bat_list[bat_index])
+    if max_tab_entries < SECTOR_SIZE/4:
+        bat = bat + pack("!%ds" % (SECTOR_SIZE - max_tab_entries*4), '')
+    return bat
+
+def gen_vhd_geometry_struct(image_size):
     totalSectors = image_size / SECTOR_SIZE
     if totalSectors > 65535*16*255:
         totalSectors = 65535*16*255
@@ -283,43 +257,42 @@ def gen_disk_geometry(image_size):
             heads = 16
             cylinderTimesHeads = totalSectors / sectorsPerTrack
     cylinders = cylinderTimesHeads / heads
-    geometry = (cylinders, heads, sectorsPerTrack)
-    #print "totalSectors = %d, Cyliders = %d, heads = %d, sectors per track = %d" % (totalSectors, cylinders, heads, sectorsPerTrack)
-    return geometry
+    geometry_struct = (cylinders, heads, sectorsPerTrack)
+    #INFO(verbose, "[gen_vhd_geometry_struct]: totalSectors = %d, Cyliders = %d, heads = %d, sectors per track = %d" % (totalSectors, cylinders, heads, sectorsPerTrack))
+    return geometry_struct
 
-def gen_vhd_bat_empty_table(image_size):
-    battab_list = []
+def gen_vhd_footer_struct(disk_type, image_size, vhd_uuid, rbd_uuid, checksum):
+    vhd_geometry_struct = gen_vhd_geometry_struct(image_size)
+    vhd_geometry = pack(VHD_DISK_GEOMETRY_FORMAT, vhd_geometry_struct[0], vhd_geometry_struct[1], vhd_geometry_struct[2])
+    reserved = ''
+    for i in range(411):
+        reserved = reserved + pack('!c', chr(0))
+    vhd_footer_struct = ('conectix', 0x00000002, 0x00010000, 0x00000200, time.time(), 'tap', 0x00010003,
+                         0x00000000, image_size, image_size, vhd_geometry, disk_type, checksum, vhd_uuid, 0,
+                         rbd_uuid, reserved)
+    return vhd_footer_struct
+
+def gen_vhd_dynamic_disk_header_struct(table_offset, image_size, checksum, parent_uuid, parent_unicode_name):
     max_tab_entries = image_size / VHD_DEFAULT_BLOCK_SIZE
-    for battab_index in range(max_tab_entries):
-        battab_list.append(0xffffffff)
-    return battab_list
-
-def gen_vhd_bat_table(battab_list):
-    max_tab_entries = len(battab_list)
-    bat = ''
-    for battab_index in range(max_tab_entries):
-        bat = bat + pack('!I', battab_list[battab_index])
-    return bat
-
-def get_bat_table(vhdfile, table_offset, max_table_entries, block_size):
-    vhdfile.seek(table_offset, 0)
-    _format_ = "!%iI" % max_table_entries
-    return unpack(_format_,vhdfile.read(max_table_entries*4))
-
-def get_bitmap_size(dynamic_disk_header):
-    sectors_in_block = dynamic_disk_header[_dynamic_disk_header_block_size_]/SECTOR_SIZE 
-    bitmap_size = sectors_in_block/8
-    if bitmap_size%512>0:
-        bitmap_size=((bitmap_size//512)+1)*512
-    return bitmap_size
+    reserved = ''
+    for i in range(256):
+        reserved = reserved + pack('!c', chr(0))
+    parent_locator_entry_empty_struct = (0x00000000, 0, 0, 0, 0) #empty
+    parent_locator_entry_empty = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_empty_struct)
+    dynamic_disk_header_struct = ('cxsparse', 0xffffffffffffffff, table_offset, 0x00010000, max_tab_entries,
+                    VHD_DEFAULT_BLOCK_SIZE, checksum, parent_uuid, time.time(), 0x00000000, parent_unicode_name.encode("UTF-16BE"),
+                    parent_locator_entry_empty, parent_locator_entry_empty, parent_locator_entry_empty,
+                    parent_locator_entry_empty, parent_locator_entry_empty, parent_locator_entry_empty,
+                    parent_locator_entry_empty, parent_locator_entry_empty,
+                    reserved)
+    return dynamic_disk_header_struct
 
 def get_sector_bitmap_and_data(vhdfile, data_block_offset, block_size):
-    sectors_in_block = block_size/512 
+    sectors_in_block = block_size/SECTOR_SIZE
     bitmap_size = sectors_in_block/8
     if bitmap_size%512>0:
         bitmap_size=((bitmap_size//512)+1)*512
     _format_ = "!%is%is" % (bitmap_size,block_size)
-    #print (_format_)
     vhdfile.seek((data_block_offset)*512, 0)
     BUFFER=vhdfile.read(bitmap_size+block_size)
     bitmap_and_data=unpack(_format_,BUFFER)
@@ -329,301 +302,401 @@ def get_sector_bitmap_and_data(vhdfile, data_block_offset, block_size):
     data = unpack(_format_,bitmap_and_data[1])
     return [bitmap_and_data[0],data]
 
-def get_bitarray_from_bitmap(bitmap, bitmap_size):
-    bitarray = []
-    _bitmap_ = bytearray()
-    _bitmap_.extend(bitmap)
-    for bitmap_index in range(bitmap_size):
-        for bit_index in range(8):
-            offset = 128 >> bit_index
-            if (_bitmap_[bitmap_index] & offset) > 0:
-                bitarray.append(1)
-            else:
-                bitarray.append(0)
-    return bitarray
-
-def gen_empty_bitarray_for_bitmap(bitmap_size):
-    bitarray = []
-    #bitmap = bytearray()
-    for bitmap_index in range(bitmap_size):
-        for bit_index in range(8):
-            bitarray.append(0)
-    return bitarray
-
-def raw_byte_offset_of_sector(block_number, sector_in_block, block_size, sector_size):
+def get_raw_byte_offset_of_sector(block_number, sector_in_block, block_size, sector_size):
     return block_number*block_size+sector_in_block*sector_size
 
-def raw_sector_offset_of_sector(block_number, sector_in_block, block_size, sector_size):
+def get_raw_sector_offset_of_sector(block_number, sector_in_block, block_size, sector_size):
     sector_per_block = block_size / sector_size
     return block_number*sector_per_block+sector_in_block
 
-def get_rbd_header(rbdfile):
-    rbdfile.seek(0, 0)
-    _buffer_ = rbdfile.read(len(RBD_HEADER))
-    return _buffer_
-
-def rbd2vhd(rbd, vhd):
+#-------------------------------------------------------------------------------------------------------------------------------------------------------#
+def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
+    
     VHD_FH = open(vhd, "wb")
-    RBDDIFF_FH = open(rbd, "rb")
-    rbd_header = get_rbd_header(RBDDIFF_FH)
+    if rbd == "-":
+        RBDDIFF_FH = sys.stdin
+    else:
+        RBDDIFF_FH = open(rbd, "rb")    
+       
+    rbd_header = RBDDIFF_FH.read(len(RBD_HEADER))
     
     rbd_meta_read_finished = 0
     vhd_headers_written = 0
     blocks_bitmaps = {}
     from_snap_name = ''
     to_snap_name = ''
+    parent_exists = False
     allocated_block_count=0
+    last_written_sector_in_block = 0
     
     while True:
-        record_tag = RBDDIFF_FH.read(1)
-        #record_tag = unpack("!c", record)
+        record_tag = RBDDIFF_FH.read(RBD_DIFF_META_RECORD_TAG_SIZE)
+        #record_tag = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_RECORD_TAG), record)
         if not record_tag:
-            print "RBD: -EOF-"
+            INFO(verbose, "[rbd2vhd]: RBD: EOF")
             break
         else:
-            #print "RBD Record TAG = \'%c\'" % record_tag
+            INFO(verbose, "[rbd2vhd]: RBD Record TAG = \'%c\'" % record_tag)
             if record_tag == "e":
-                print "RBD: EOF"
+                INFO(verbose, "[rbd2vhd]: RBD: EOF")
                 break
             if record_tag == "f":
-                record = RBDDIFF_FH.read(4)
-                snap_name_length = unpack('!'+RBD_DIFF_META_SNAP,record)
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SNAP_SIZE)
+                snap_name_length = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SNAP), record)[0])
                 record = RBDDIFF_FH.read(snap_name_length)
-                from_snap_name = unpack("!%ds" % snap_name_length,record)
-                print "RBD: From snap = %s" % from_snap_name
+                from_snap_name = unpack("%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, snap_name_length),record)[0]
+                regex = re.compile(SNAPSHOT_PREFIX)
+                from_snap_name = regex.sub('', from_snap_name)
+                INFO(verbose, "[rbd2vhd]: RBD: From snap = %s" % from_snap_name)
             elif record_tag == "t":
-                record = RBDDIFF_FH.read(4)
-                snap_name_length = unpack('!'+RBD_DIFF_META_SNAP,record)
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SNAP_SIZE)
+                snap_name_length = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SNAP), record)[0])
                 record = RBDDIFF_FH.read(snap_name_length)
-                to_snap_name = unpack("!%ds" % snap_name_length,record)
-                print "RBD: To snap = %s" % from_snap_name
+                to_snap_name = unpack("%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, snap_name_length),record)[0]
+                regex = re.compile(SNAPSHOT_PREFIX)
+                to_snap_name = regex.sub('', to_snap_name)
+                INFO(verbose, "[rbd2vhd]: RBD: To snap = %s" % to_snap_name)
             elif record_tag == "s":
-                record = RBDDIFF_FH.read(8)
-                image_size = int(unpack('!'+RBD_DIFF_META_SIZE,record)[0])
-                print "RBD: Image size = %d" % image_size
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SIZE_SIZE)
+                image_size = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SIZE), record)[0])
+                INFO(verbose, "[rbd2vhd]: RBD: Image size = %d" % image_size)
             elif record_tag == "w":
-                record = RBDDIFF_FH.read(16)
-                _record_ = unpack('!'+RBD_DIFF_DATA,record)
+                record = RBDDIFF_FH.read(RBD_DIFF_DATA_SIZE)
+                _record_ = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_DATA), record)
                 offset = _record_[0]
                 length = _record_[1]
-                record = RBDDIFF_FH.read(length)
-                data = unpack("!%ds" % length, record)
-                print "RBD: Data offset = 0x%08x and length = %d" % (offset, length)
+                INFO(verbose, "[rbd2vhd]: RBD: Data offset = 0x%08x and length = %d" % (offset, length))
                 if rbd_meta_read_finished == 0:
                     rbd_meta_read_finished = 1
             elif record_tag == "z":
-                record = RBDDIFF_FH.read(16)
-                _record_ = unpack('!'+RBD_DIFF_DATA,record)
+                record = RBDDIFF_FH.read(RBD_DIFF_DATA_SIZE)
+                _record_ = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_DATA), record)
                 offset = _record_[0]
                 length = _record_[1]
-                record = ''
-                for i in range(length):
-                    record = record + pack('!c', chr(0))
-                print "RBD: Zero data offset = 0x%08x and length = %d" % (offset, length)
+                INFO(verbose, "[rbd2vhd]: RBD: Zero data offset = 0x%08x and length = %d" % (offset, length))
                 if rbd_meta_read_finished == 0:
                     rbd_meta_read_finished = 1
-                data = unpack("!%ds" % length, record)
             else:
-                print "RBD: Error while reading"
-            
+                ERROR(verbose, "[rbd2vhd]: RBD: Error while reading rbd_diff file")
+                sys.exit(2)
+                
             if (rbd_meta_read_finished == 1) & (vhd_headers_written == 0):
+                if rbd_image_uuid == '':
+                    ERROR(verbose, "[rbd2vhd]: RBD: Error: RBD image UUID is not specified")
+                    sys.exit(1)
                 if from_snap_name:
                         parent_uuid = uuid.UUID(from_snap_name)
+                        parent_exists = True
                 else:
                         parent_uuid = uuid.UUID('00000000-0000-0000-0000-000000000000')
+                        parent_exists = False
                 if to_snap_name:
-                    image_uuid = uuid.UUID(to_snap_name)
+                    vhd_uuid = uuid.UUID(to_snap_name)
+                    rbd_uuid = uuid.UUID(rbd_image_uuid)
                 else:
-                    image_uuid = uuid.UUID('00000000-0000-0000-0000-000000000000')
-                vhd_footer_struct = gen_vhd_footer_struct(VHD_DIFF_HARDDISK_TYPE, image_size, image_uuid.bytes, 0)
+                    vhd_uuid = uuid.UUID(rbd_image_uuid)
+                    rbd_uuid = uuid.UUID(rbd_image_uuid)
+                
+                if parent_exists:
+                    vhd_footer_struct = gen_vhd_footer_struct(VHD_DIFF_HARDDISK_TYPE, image_size, vhd_uuid.bytes, rbd_uuid.bytes, 0)
+                else:
+                    vhd_footer_struct = gen_vhd_footer_struct(VHD_DYNAMIC_HARDDISK_TYPE, image_size, vhd_uuid.bytes, rbd_uuid.bytes, 0)
                 VHD_FOOTER = pack(VHD_FOTTER_FORMAT, *vhd_footer_struct)
-                checksum = gen_vhd_checksum(VHD_FOOTER)
-                vhd_footer_struct = gen_vhd_footer_struct(VHD_DIFF_HARDDISK_TYPE, image_size, image_uuid.bytes, checksum)
-                #print "checksum %d = 0x%08x" % (checksum, checksum)
+                vhd_footer_struct = modTupleByIndex(vhd_footer_struct, _vhd_footter_checksum_, checksum(VHD_FOOTER))
                 VHD_FOOTER = pack(VHD_FOTTER_FORMAT, *vhd_footer_struct)
                 
-                dynamic_disk_header_struct = gen_vhd_dynamic_disk_header_struct(0x0000000000000600, image_size, 0, parent_uuid.bytes, "%s.vhd" % str(parent_uuid))
-                DYNAMIC_DISK_HEADER = pack(VHD_DYNAMIC_DISK_HEADER_FORMAT, *dynamic_disk_header_struct)
-                checksum = gen_vhd_checksum(DYNAMIC_DISK_HEADER)
-                dynamic_disk_header_struct = gen_vhd_dynamic_disk_header_struct(0x0000000000000600, image_size, checksum, parent_uuid.bytes, "%s.vhd" % str(parent_uuid))
-                DYNAMIC_DISK_HEADER = pack(VHD_DYNAMIC_DISK_HEADER_FORMAT, *dynamic_disk_header_struct)
-                BAT_STRUCT = gen_vhd_bat_empty_table(10737418240)
-                BAT = gen_vhd_bat_table(BAT_STRUCT)
-    
+                if parent_exists:
+                    vhd_dynamic_disk_header_struct = gen_vhd_dynamic_disk_header_struct(VHD_FOTTER_RECORD_SIZE+VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE, image_size, 0, parent_uuid.bytes, "%s.vhd" % str(parent_uuid))
+                else:
+                    vhd_dynamic_disk_header_struct = gen_vhd_dynamic_disk_header_struct(VHD_FOTTER_RECORD_SIZE+VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE, image_size, 0, '', '')
+                VHD_DYNAMIC_DISK_HEADER = pack(VHD_DYNAMIC_DISK_HEADER_FORMAT, *vhd_dynamic_disk_header_struct)
+                vhd_footer_struct = modTupleByIndex(vhd_dynamic_disk_header_struct, _dynamic_disk_header_checksum_, checksum(VHD_DYNAMIC_DISK_HEADER))
+                VHD_DYNAMIC_DISK_HEADER = pack(VHD_DYNAMIC_DISK_HEADER_FORMAT, *vhd_dynamic_disk_header_struct)
+                
+                vhd_bat_list = gen_empty_vhd_bat(image_size)
+                VHD_BAT = pack_vhd_bat(vhd_bat_list)
+                
+                vhd_file_offset = 0
+                
                 VHD_FH.write(VHD_FOOTER)
-                VHD_FH.write(DYNAMIC_DISK_HEADER)
-                VHD_FH.write(BAT)
-                data_offset = VHD_FH.tell()
+                vhd_file_offset += VHD_FOTTER_RECORD_SIZE
                 
-                print_vhd_footer(vhd_footer_struct)
-                print_dynamic_disk_header(dynamic_disk_header_struct)
+                VHD_FH.write(VHD_DYNAMIC_DISK_HEADER)
+                vhd_file_offset += VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE
+                
+                VHD_FH.write(VHD_BAT)
+                vhd_file_offset += len(VHD_BAT)
+                
+                VHD_BATMAP = gen_empty_batmap()
+                vhd_batmap_header_struct = gen_batmap_header(VHD_BATMAP)
+                vhd_batmap_header_struct = modTupleByIndex(vhd_batmap_header_struct, _batmap_offset_, vhd_file_offset+VHD_BATMAP_HEADER_SIZE)
+                vhd_batmap_header_struct = modTupleByIndex(vhd_batmap_header_struct, _batmap_size_, len(VHD_BATMAP)/SECTOR_SIZE)
+                vhd_batmap_header_struct = modTupleByIndex(vhd_batmap_header_struct, _batmap_checksum_, checksum(VHD_BATMAP))
+                VHD_BATMAP_HEADER = pack(VHD_BATMAP_HEADER_FORMAT, *vhd_batmap_header_struct)
+                
+                VHD_FH.write(VHD_BATMAP_HEADER)
+                vhd_file_offset += VHD_BATMAP_HEADER_SIZE
+                
+                VHD_FH.write(VHD_BATMAP)
+                vhd_file_offset += len(VHD_BATMAP)
+                
+                for index in range(VHD_PARENT_LOCATORS_COUNT):
+                    if parent_exists:
+                        if index == 0:
+                            parent_locator = "file://./%s.vhd" % parent_uuid
+                            parent_locator_encoded = parent_locator
+                            parent_locator_entry_struct = (_platform_code_MacX_, get_size_aligned_to_sector_boundary(len(parent_locator_encoded)), len(parent_locator_encoded), 0, vhd_file_offset) #MacX
+                        elif index == 1:
+                            parent_locator = ".\%s.vhd" % parent_uuid
+                            parent_locator_encoded = parent_locator.encode("UTF-16BE")
+                            parent_locator_entry_struct = (_platform_code_W2ku_, get_size_aligned_to_sector_boundary(len(parent_locator_encoded)), len(parent_locator_encoded), 0, vhd_file_offset) #W2ku
+                        elif index == 2:
+                            parent_locator = ".\%s.vhd" % parent_uuid
+                            parent_locator_encoded = parent_locator.encode("UTF-16BE")
+                            parent_locator_entry_struct = (_platform_code_W2ru_, get_size_aligned_to_sector_boundary(len(parent_locator_encoded)), len(parent_locator_encoded), 0, vhd_file_offset) #W2ru
+                        else:
+                            parent_locator_encoded = ''
+                            parent_locator_entry_struct = (0x00000000, 0, 0, 0, 0) #empty
+                    else:
+                        parent_locator_encoded = ''
+                        parent_locator_entry_struct = (0x00000000, 0, 0, 0, 0) #empty
+                    
+                    if len(parent_locator_encoded) > 0:
+                        parent_locator_packed = pack("!%ds" % get_size_aligned_to_sector_boundary(len(parent_locator_encoded)), parent_locator_encoded)
+                    else:
+                        parent_locator_packed = pack("!%ds" % SECTOR_SIZE, parent_locator_encoded)
+                        
+                    parent_locator_entry = pack(VHD_PARENT_LOCATOR_ENTRY_FORMAT, *parent_locator_entry_struct)
+                    vhd_dynamic_disk_header_struct = modTupleByIndex(vhd_dynamic_disk_header_struct, _dynamic_disk_header_parent_locator_entry_1_ + index, parent_locator_entry)
+                    
+                    VHD_FH.write(parent_locator_packed)
+                    vhd_file_offset += len(parent_locator_packed)
+                    
+                #print_vhd_footer(vhd_footer_struct)
+                #print_dynamic_disk_header(dynamic_disk_header_struct)
                 
                 vhd_headers_written = 1
-                block_bitmap_size = get_bitmap_size(dynamic_disk_header_struct)
+                block_bitmap_size = get_bitmap_size(vhd_dynamic_disk_header_struct)
+                data_offset = vhd_file_offset
+                
+                INFO(verbose, "[rbd2vhd]: Begining of data offset 0x%08x" % data_offset)
+                INFO(verbose, "[rbd2vhd]: Begining of data real offset 0x%08x" % VHD_FH.tell())
                 
             if (rbd_meta_read_finished == 1) & (vhd_headers_written == 1):
-                #write data
-                databytearray = bytearray()
-                databytearray.extend(data[0])
-                SectorPerBlock = VHD_DEFAULT_BLOCK_SIZE / SECTOR_SIZE
-                print "SectorPerBlock = %d, offset = %d, length = %d" % (SectorPerBlock, offset, length)
-                for _offset_ in range(offset,offset+length):
-                    #print "_offset _= %d" % _offset_
+                _offset_ = offset
+                while length > 0:
+                    SectorsPerBlock = VHD_DEFAULT_BLOCK_SIZE / SECTOR_SIZE
                     RawSectorNumber = _offset_ / SECTOR_SIZE
                     BlockNumber = RawSectorNumber // (VHD_DEFAULT_BLOCK_SIZE//SECTOR_SIZE)
-                    SectorInBlock = RawSectorNumber % SectorPerBlock
+                    SectorInBlock = RawSectorNumber % SectorsPerBlock
                     
-                    if blocks_bitmaps.has_key(BlockNumber):
-                        if blocks_bitmaps[BlockNumber][SectorInBlock] == 0:
-                            del blocks_bitmaps[BlockNumber][SectorInBlock]
-                            blocks_bitmaps[BlockNumber].insert(SectorInBlock, 1)
-                    else:
-                        blocks_bitmaps[BlockNumber] = gen_empty_bitarray_for_bitmap(block_bitmap_size)
-                        del blocks_bitmaps[BlockNumber][SectorInBlock]
-                        blocks_bitmaps[BlockNumber].insert(SectorInBlock, 1)
-                    
-                    #print "VHD BlockNumber %d" % BlockNumber
-                    
-                    if BAT_STRUCT[BlockNumber] == 0xffffffff:
-                        block_offset_in_sectors = (data_offset+(allocated_block_count*VHD_DEFAULT_BLOCK_SIZE))/SECTOR_SIZE + SectorInBlock
-                        block_offset_in_bytes = block_offset_in_sectors * SECTOR_SIZE
-                        BAT_STRUCT[BlockNumber] = block_offset_in_sectors
+                    if vhd_bat_list[BlockNumber] == 0xffffffff:
+                        if last_written_sector_in_block != 0:
+                            INFO(verbose, "[rbd2vhd]: Write %d zero sectors to the end of block" % (SectorsPerBlock - SectorInBlock - read_sectors))
+                            _buffer_ = pack("!%ds" % ((SectorsPerBlock - last_written_sector_in_block)*SECTOR_SIZE), '')
+                            VHD_FH.write(_buffer_)
+                            vhd_file_offset += (SectorsPerBlock - SectorInBlock - read_sectors)*SECTOR_SIZE
+                        INFO(verbose, "[rbd2vhd]: New block %d allocated" % BlockNumber)
+                        block_offset_in_bytes = data_offset+allocated_block_count*VHD_DEFAULT_BLOCK_SIZE + block_bitmap_size*allocated_block_count
+                        block_offset_in_sectors = block_offset_in_bytes / SECTOR_SIZE
+                        vhd_bat_list[BlockNumber] = block_offset_in_sectors
+                        INFO(verbose, "[rbd2vhd]: New block offset in bytes 0x%08x" % block_offset_in_bytes)
+                        INFO(verbose, "[rbd2vhd]: New block offset in sectors %d" % block_offset_in_sectors)
                         allocated_block_count = allocated_block_count + 1
-                        VHD_FH.seek(block_offset_in_bytes, 0)
-                        print "VHD position %d; BlockNumber %d" % (BAT_STRUCT[BlockNumber], BlockNumber)
+                        INFO(verbose, "[rbd2vhd]: Write %d bytes of empty sectors bitmap" % len(gen_bitmap_from_bitarray(gen_empty_bitarray_for_bitmap(block_bitmap_size))))
+                        VHD_FH.write(gen_bitmap_from_bitarray(gen_empty_bitarray_for_bitmap(block_bitmap_size)))
+                        INFO(verbose, "[rbd2vhd]: Skeep %d bytes (%d sectors)" % (SectorInBlock*SECTOR_SIZE, SectorInBlock))
+                        VHD_FH.seek(SectorInBlock*SECTOR_SIZE,1)
+                        vhd_file_offset += block_bitmap_size + SectorInBlock*SECTOR_SIZE
+                        last_written_sector_in_block = 0
                     
-                    VHD_FH.write(pack('!B', databytearray[_offset_ - offset]))
-    # rewrite BAT
+                    if length < (SectorsPerBlock-SectorInBlock)*SECTOR_SIZE:
+                        if record_tag == "w":
+                            _buffer_ = RBDDIFF_FH.read(length)
+                        elif record_tag == "z":
+                            _buffer_ = pack("!$ds" % length, '')
+                        read_length = length
+                        length = 0
+                    else:
+                        if record_tag == "w":
+                            _buffer_ = RBDDIFF_FH.read((SectorsPerBlock-SectorInBlock)*SECTOR_SIZE)
+                        elif record_tag == "z":
+                            _buffer_ = pack("!$ds" % (SectorsPerBlock-SectorInBlock)*SECTOR_SIZE, '')
+                        read_length = (SectorsPerBlock-SectorInBlock)*SECTOR_SIZE
+                        length = length - read_length
+                    
+                    read_sectors = read_length/SECTOR_SIZE
+                    
+                    for sector_index in range(read_length/SECTOR_SIZE):
+                        if blocks_bitmaps.has_key(BlockNumber):
+                            if blocks_bitmaps[BlockNumber][SectorInBlock+sector_index] == 0:
+                                del blocks_bitmaps[BlockNumber][SectorInBlock+sector_index]
+                                blocks_bitmaps[BlockNumber].insert(SectorInBlock+sector_index, 1)
+                        else:
+                            blocks_bitmaps[BlockNumber] = gen_empty_bitarray_for_bitmap(block_bitmap_size)
+                            del blocks_bitmaps[BlockNumber][SectorInBlock+sector_index]
+                            blocks_bitmaps[BlockNumber].insert(SectorInBlock+sector_index, 1)
+                    
+                    INFO(verbose, "[rbd2vhd]: SectorsPerBlock %d, SectorInBlock %d, read_sectors %d" % (SectorsPerBlock, SectorInBlock, read_sectors))
+                    
+                    if last_written_sector_in_block != 0:
+                        sectors_to_skeep = SectorInBlock - last_written_sector_in_block
+                        INFO(verbose, "[rbd2vhd]: Skeep %d sectors to the next sector with data" % sectors_to_skeep)
+                        VHD_FH.seek(sectors_to_skeep*SECTOR_SIZE,1)
+                        vhd_file_offset += sectors_to_skeep*SECTOR_SIZE
+                    
+                    INFO(verbose, "[rbd2vhd]: Write %d bytes of data" % len(_buffer_))
+                    VHD_FH.write(_buffer_)
+                    vhd_file_offset += read_length
+                    _offset_ += read_length
+                    
+                    last_written_sector_in_block = SectorInBlock + read_sectors
+    
+    if last_written_sector_in_block != 0:
+        INFO(verbose, "[rbd2vhd]: Write %d zero sectors to the end of block" % (SectorsPerBlock - SectorInBlock - read_sectors))
+        _buffer_ = pack("!%ds" % ((SectorsPerBlock - last_written_sector_in_block)*SECTOR_SIZE), '')
+        VHD_FH.write(_buffer_)
+        vhd_file_offset += (SectorsPerBlock - SectorInBlock - read_sectors)*SECTOR_SIZE
+    
     VHD_FH.write(VHD_FOOTER)
-    VHD_FH.seek(VHD_FOTTER_RECORD_SIZE+VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE, 0)
-    BAT = gen_vhd_bat_table(BAT_STRUCT)
-    VHD_FH.write(BAT)
+    VHD_FH.seek(VHD_FOTTER_RECORD_SIZE,0)
+    VHD_DYNAMIC_DISK_HEADER = pack(VHD_DYNAMIC_DISK_HEADER_FORMAT, *vhd_dynamic_disk_header_struct)
+    VHD_FH.write(VHD_DYNAMIC_DISK_HEADER)
+    vhd_file_offset = VHD_FOTTER_RECORD_SIZE + VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE
+    VHD_BAT = pack_vhd_bat(vhd_bat_list)
+    VHD_FH.write(VHD_BAT)
+    vhd_file_offset += len(VHD_BAT)
+    INFO(verbose, "[rbd2vhd]: Rewrite BAT (write %d entries, %d bytes)" % (vhd_dynamic_disk_header_struct[_dynamic_disk_header_max_table_entries_], vhd_dynamic_disk_header_struct[_dynamic_disk_header_max_table_entries_]*4))
+    
+    INFO(verbose, "[rbd2vhd]: Current offset in VHD file is 0x%08x" % vhd_file_offset)
+    
+    for BlockNumber in range(len(vhd_bat_list)):
+        if vhd_bat_list[BlockNumber] != 0xffffffff:
+            INFO(verbose, "[rbd2vhd]: Block %d offset is 0x%08x, skeep 0x%08x bytes from last offest 0x%08x" % (BlockNumber, vhd_bat_list[BlockNumber]*SECTOR_SIZE, (vhd_bat_list[BlockNumber]*SECTOR_SIZE-vhd_file_offset), vhd_file_offset))
+            VHD_FH.seek((vhd_bat_list[BlockNumber]*SECTOR_SIZE-vhd_file_offset),1)
+            vhd_file_offset = vhd_bat_list[BlockNumber]*SECTOR_SIZE
+            INFO(verbose, "[rbd2vhd]: Rewrite block %d sector bitmap" % BlockNumber)
+            VHD_FH.write(gen_bitmap_from_bitarray(blocks_bitmaps[BlockNumber]))
+            vhd_file_offset += block_bitmap_size
     
     VHD_FH.close
-    RBDDIFF_FH.close
+    if RBDDIFF_FH is not sys.stdin:
+        RBDDIFF_FH.close
+    
     return 0
-
-def vhd2rbd(vhd, rbd):
-    #VHD_FH = open("/run/sr-mount/e0f1d862-1e8a-df94-2bd2-3260732d6702/41cd1cc1-97b3-4774-83d3-6208bca53cb3.vhd", "rb")
-    #VHD_FH = open("/run/sr-mount/e0f1d862-1e8a-df94-2bd2-3260732d6702/75d74d1e-31d8-487a-820b-7d0f8014af60.vhd", "rb")
-    #RBDDIFF_FH = open("/run/sr-mount/e0f1d862-1e8a-df94-2bd2-3260732d6702/75d74d1e-31d8-487a-820b-7d0f8014af60.rbddiff", "wb")
+#-------------------------------------------------------------------------------------------------------------------------------------------------------#
+def vhd2rbd(vhd, rbd, verbose):
     
     VHD_FH = open(vhd, "rb")
-    RBDDIFF_FH = open(rbd, "wb")
+    if rbd == "-":
+        RBDDIFF_FH = sys.stdout
+    else:
+        RBDDIFF_FH = open(rbd, "wb")
     
-    VHD_FOOTER = get_vhd_footer_b(VHD_FH)
-    print_vhd_footer(VHD_FOOTER)
-    DYNAMIC_DISK_HEADER = get_dynamic_disk_header(VHD_FH)
-    print_dynamic_disk_header(VHD_FH, DYNAMIC_DISK_HEADER)
-    BATMAP = get_vhd_batmap(VHD_FH, DYNAMIC_DISK_HEADER)
-    print_vhd_batmap(BATMAP)
-    BLOCK_SIZE = DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_]
+    VHD_FOOTER = unpack(VHD_FOTTER_FORMAT, VHD_FH.read(VHD_FOTTER_RECORD_SIZE))
+    DYNAMIC_DISK_HEADER = unpack(VHD_DYNAMIC_DISK_HEADER_FORMAT, VHD_FH.read(VHD_DYNAMIC_DISK_HEADER_RECORD_SIZE))
+    BAT_TABLE = unpack("!%iI" % DYNAMIC_DISK_HEADER[_dynamic_disk_header_max_table_entries_],
+                       VHD_FH.read(DYNAMIC_DISK_HEADER[_dynamic_disk_header_max_table_entries_]*4))
+    BATMAP_HEADER = unpack(VHD_BATMAP_HEADER_FORMAT, VHD_FH.read(VHD_BATMAP_HEADER_SIZE))
     
-    BAT_TABLE = get_bat_table(VHD_FH, DYNAMIC_DISK_HEADER[_dynamic_disk_header_table_offset_], DYNAMIC_DISK_HEADER[_dynamic_disk_header_max_table_entries_], DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_])
     # Write RBD diff header
-    #print("Writing RBD diff header ...")
+    INFO(verbose, "[vhd2rbd]: Writing RBD diff header ...")
     RBDDIFF_FH.write(RBD_HEADER)
-    # Write RBD Size record
-    #print("Writing RBD Size record ...")
-    rbddiff_image_size = pack(RBD_DIFF_RECORD_TAG+RBD_DIFF_META_SIZE, 's', VHD_FOOTER[_vhd_footter_current_size_])
-    RBDDIFF_FH.write(rbddiff_image_size)
     
+    # Write RBD from_snap record
+    if DYNAMIC_DISK_HEADER[_dynamic_disk_header_parent_unique_id_] != '\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00':
+        from_snap_uuid = uuid.UUID(bytes=DYNAMIC_DISK_HEADER[_dynamic_disk_header_parent_unique_id_])
+        from_snap = "%s%s" % (SNAPSHOT_PREFIX, str(from_snap_uuid))
+        RBDDIFF_FH.write(pack("%s%s%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_RECORD_TAG, RBD_DIFF_META_SNAP, len(from_snap)), 'f', len(from_snap), from_snap))
+    
+    # Write RBD to_snap record
+    if VHD_FOOTER[_vhd_footter_unique_iq_] != VHD_FOOTER[_vhd_footter_rbd_image_uuid_]:
+        to_snap_uuid = uuid.UUID(bytes=VHD_FOOTER[_vhd_footter_unique_iq_])
+        to_snap = "%s%s" % (SNAPSHOT_PREFIX, str(to_snap_uuid))
+        RBDDIFF_FH.write(pack("%s%s%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_RECORD_TAG, RBD_DIFF_META_SNAP, len(to_snap)), 't', len(to_snap), to_snap))
+    
+    # Write RBD Size record
+    RBDDIFF_FH.write(pack(RBD_DIFF_META_ENDIAN_PREFIX+RBD_DIFF_META_RECORD_TAG+RBD_DIFF_META_SIZE, 's', VHD_FOOTER[_vhd_footter_current_size_]))
     
     total_changed_sectors = 0
     total_changed_sectors_ = 0
-    raw_first_sector = 0
-    raw_last_sector = 0
-    in_block_first_sector = 0
-    in_block_last_sector = 0
+    raw_first_sector = -1
+    raw_last_sector = -1
+    in_block_first_sector = -1
+    in_block_last_sector = -1
+    
     for block_index in range(DYNAMIC_DISK_HEADER[_dynamic_disk_header_max_table_entries_]):
         if BAT_TABLE[block_index] != 0xffffffff:
-            DATA_BLOCK = get_sector_bitmap_and_data(VHD_FH, BAT_TABLE[block_index], BLOCK_SIZE)
+            DATA_BLOCK = get_sector_bitmap_and_data(VHD_FH, BAT_TABLE[block_index], DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_])
             
             BITMAP_SIZE = get_bitmap_size(DYNAMIC_DISK_HEADER)
-            print "BLOCK_NUMBER %d" % block_index
+            INFO(verbose, "[vhd2rbd]: Read VHD block %d" % block_index)
             
-            BITARRAY = get_bitarray_from_bitmap(DATA_BLOCK[0], BITMAP_SIZE)
-            #print (BITARRAY)
+            BITMAPARRAY = get_bitarray_from_bitmap(DATA_BLOCK[0], BITMAP_SIZE)
+            
             for sector_in_block_index in range(BITMAP_SIZE*8):
-                #print("bit_index - %d, value = %d" % (sector_in_block_index,BITARRAY[sector_in_block_index]))
-                if BITARRAY[sector_in_block_index] == 1:
-                    ##print("Sector: %d" % sector_in_block_index)
-                    #print("DATA: ", DATA_BLOCK[1][sector_in_block_index])
-                    #print("sector_in_block_index - %d" % sector_in_block_index)
-                    total_changed_sectors_ = total_changed_sectors_ + 1
-                    if raw_first_sector == 0:
-                        raw_first_sector = raw_sector_offset_of_sector(block_index, sector_in_block_index, BLOCK_SIZE, SECTOR_SIZE)
+                if BITMAPARRAY[sector_in_block_index] == 1:
+                    INFO(verbose, "[vhd2rbd]: Read sector %d with data in block %d" % (sector_in_block_index, block_index))
+                    total_changed_sectors_ += 1
+                    if raw_first_sector == -1:
+                        raw_first_sector = get_raw_sector_offset_of_sector(block_index, sector_in_block_index, DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_], SECTOR_SIZE)
                         in_block_first_sector = sector_in_block_index
-                        raw_last_sector = 0
+                        raw_last_sector = -1
                 else:
-                    if (raw_last_sector == 0) & (raw_first_sector != 0) :
-                        raw_last_sector = raw_sector_offset_of_sector(block_index, sector_in_block_index-1, BLOCK_SIZE, SECTOR_SIZE)
+                    if (raw_last_sector == -1) & (raw_first_sector != -1) :
+                        raw_last_sector = get_raw_sector_offset_of_sector(block_index, sector_in_block_index-1, DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_], SECTOR_SIZE)
                         in_block_last_sector = sector_in_block_index-1
-                        #print("\tRaw From sector %d to sector %d" % (raw_first_sector, raw_last_sector))
-                        #print("\tInBlock From sector %d to sector %d" % (in_block_first_sector, in_block_last_sector))
-                        
+                        INFO(verbose, "[vhd2rbd]: Data sectors range (raw) %d - %d" % (raw_first_sector, raw_last_sector))
+                        INFO(verbose, "[vhd2rbd]: Data sectors range (in block) %d - %d" % (in_block_first_sector, in_block_last_sector))
                         # Write RBD data record header
-                        #print("Writing RBD data record header ...")
-                        rbddiff_data_header = pack(RBD_DIFF_RECORD_TAG+RBD_DIFF_DATA, 'w', raw_first_sector*512,(raw_last_sector-raw_first_sector+1)*512)
-                        #print("\tSectors: %d" % (raw_last_sector-raw_first_sector+1))
-                        #print("\tBytes: %d" % ((raw_last_sector-raw_first_sector+1)*512))
-                        RBDDIFF_FH.write(rbddiff_data_header)
+                        INFO(verbose, "[vhd2rbd]: Write RBD data record header ...")
+                        RBDDIFF_FH.write(pack(RBD_DIFF_META_ENDIAN_PREFIX+RBD_DIFF_META_RECORD_TAG+RBD_DIFF_DATA, 'w', raw_first_sector*512,(raw_last_sector-raw_first_sector+1)*512))
+                        INFO(verbose, "[vhd2rbd]: Write RBD data record data ...")
                         for sector_index in range(in_block_first_sector, in_block_last_sector+1):
+                            INFO(verbose, "[vhd2rbd]: Write sector %d from block %d" % (sector_index, block_index))
+                            total_changed_sectors += 1
                             # Write RBD data record data
-                            #print("Writing RBD data record data ...")
-                            #print("Writing Sector: %d" % sector_index)
-                            total_changed_sectors = total_changed_sectors + 1
-                            #print("DATA: ", DATA_BLOCK[1][sector_index])
-                            rbddiff_data = pack("!512s",DATA_BLOCK[1][sector_index])
-                            RBDDIFF_FH.write(rbddiff_data)
-                        
-                        raw_first_sector = 0
-                        raw_last_sector = 0
-                        in_block_first_sector = 0
-                        in_block_last_sector = 0
-            if (sector_in_block_index == BITMAP_SIZE*8-1) and (raw_first_sector != 0) :
-                raw_last_sector = raw_sector_offset_of_sector(block_index, sector_in_block_index, BLOCK_SIZE, SECTOR_SIZE)
+                            RBDDIFF_FH.write(pack(RBD_DIFF_META_ENDIAN_PREFIX+"512s",DATA_BLOCK[1][sector_index]))
+                        raw_first_sector = -1
+                        raw_last_sector = -1
+                        in_block_first_sector = -1
+                        in_block_last_sector = -1
+            
+            if (sector_in_block_index == BITMAP_SIZE*8-1) and (raw_first_sector != -1) :
+                raw_last_sector = get_raw_sector_offset_of_sector(block_index, sector_in_block_index, DYNAMIC_DISK_HEADER[_dynamic_disk_header_block_size_], SECTOR_SIZE)
                 in_block_last_sector = sector_in_block_index
-                #print("\tRaw From sector %d to sector %d" % (raw_first_sector, raw_last_sector))
-                #print("\tInBlock From sector %d to sector %d" % (in_block_first_sector, in_block_last_sector))
-                
+                INFO(verbose, "[vhd2rbd]: Data sectors range (raw) %d - %d" % (raw_first_sector, raw_last_sector))
+                INFO(verbose, "[vhd2rbd]: Data sectors range (in block) %d - %d" % (in_block_first_sector, in_block_last_sector))
                 # Write RBD data record header
-                #print("Writing RBD data record header ...")
-                rbddiff_data_header = pack(RBD_DIFF_RECORD_TAG+RBD_DIFF_DATA, 'w', raw_first_sector*512,(raw_last_sector-raw_first_sector+1)*512)
-                #print("\tSectors: %d" % (raw_last_sector-raw_first_sector+1))
-                #print("\tBytes: %d" % ((raw_last_sector-raw_first_sector+1)*512))
-                RBDDIFF_FH.write(rbddiff_data_header)
+                RBDDIFF_FH.write(pack(RBD_DIFF_META_ENDIAN_PREFIX+RBD_DIFF_META_RECORD_TAG+RBD_DIFF_DATA, 'w', raw_first_sector*512,(raw_last_sector-raw_first_sector+1)*512))
+                INFO(verbose, "[vhd2rbd]: Write RBD data record header ...")
                 for sector_index in range(in_block_first_sector, in_block_last_sector+1):
+                    INFO(verbose, "[vhd2rbd]: Write sector %d from block %d" % (sector_index, block_index))
                     # Write RBD data record data
-                    #print("Writing RBD data record data ...")
-                    #print("Writing Sector: %d" % sector_index)
-                    total_changed_sectors = total_changed_sectors + 1
-                    #print("DATA: ", DATA_BLOCK[1][sector_index])
-                    rbddiff_data = pack("!512s",DATA_BLOCK[1][sector_index])
-                    RBDDIFF_FH.write(rbddiff_data)
-                
-                raw_first_sector = 0
-                raw_last_sector = 0
-                in_block_first_sector = 0
-                in_block_last_sector = 0
-            
-    #DATA = DATA_BLOCK[1]
-            
-    #for bitmap_index in range(0, BITMAP_SIZE-1):
-    #    if BITMAP[bitmap_index] != 0:
-    #        print "BAT[%i] - BITMAP[%i] => 0x%02x" % (bat_index, bitmap_index, BITMAP[bitmap_index])
-    print("Total changed sectors: %d - %d" % (total_changed_sectors,total_changed_sectors_))
-    print("Total changed bytes: %d - %d" % ((total_changed_sectors*512),(total_changed_sectors_*512)))
+                    total_changed_sectors += 1
+                    RBDDIFF_FH.write(pack(RBD_DIFF_META_ENDIAN_PREFIX+"512s",DATA_BLOCK[1][sector_index]))
+                raw_first_sector = -1
+                raw_last_sector = -1
+                in_block_first_sector = -1
+                in_block_last_sector = -1
+    
+    INFO(verbose, "[vhd2rbd]: Total wrintten sectors : %d" % total_changed_sectors)
+    INFO(verbose, "[vhd2rbd]: Total written bytes: %d" % (total_changed_sectors*512))
     
     RBDDIFF_FH.write('e')
     
     VHD_FH.close
-    RBDDIFF_FH.close
+    if RBDDIFF_FH is not sys.stdout:
+        RBDDIFF_FH.close
+    
     return 0
 #-------------------------------------------------------------------------------------------------------------------------------------------------------#
 def main(argv):
     vhd_file = ''
     rbd_file = ''
+    vhd_uuid = ''
+    verbose = False
+    
     cmdname = sys.argv[0]
     regex = re.compile('.*/*.*/')
     cmdname = regex.sub('', cmdname)
@@ -632,34 +705,38 @@ def main(argv):
     
     if len(sys.argv) > 1:
         try:
-            opts, args = getopt.getopt(argv,"hv:r:",["vhd=","rbd="])
+            opts, args = getopt.getopt(argv,"hv",["vhd=","rbd=","uuid="])
         except getopt.GetoptError:
-            print "Usage:"
-            print '\tvhd2rbd -v <vhd_file> -r <rbd_file>'
-            print '\trbd2vhd -r <rbd_file> -v <vhd_file>'
+            eprint('Usage:')
+            eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
+            eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-v]')
             sys.exit(2)
         for opt, arg in opts:
             if opt == '-h':
-                print "Usage:"
-                print '\tvhd2rbd -v <vhd_file> -r <rbd_file>'
-                print '\trbd2vhd -r <rbd_file> -v <vhd_file>'
+                eprint('Usage:')
+                eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
+                eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-v]')
                 sys.exit()
-            elif opt in ("-v", "--vhd"):
+            if opt == '-v':
+                verbose = True
+            elif opt == '--vhd':
                 vhd_file = arg
-            elif opt in ("-r", "--rbd"):
+            elif opt == '--rbd':
                 rbd_file = arg
-        print 'VHD file is \'%s\'' % vhd_file
-        print 'RBD file is \'%s\'' % rbd_file
+            elif opt == '--uuid':
+                vhd_uuid = arg
+        INFO(verbose, "[main]: VHD file is \'%s\'" % vhd_file)
+        INFO(verbose, "[main]: RBD file is \'%s\'" % rbd_file)
         
         if (cmdname == 'vhd2rbd'):
-            vhd2rbd(vhd_file, rbd_file)
+            vhd2rbd(vhd_file, rbd_file, verbose)
         elif(cmdname == 'rbd2vhd'):
-            rbd2vhd(rbd_file, vhd_file)
+            rbd2vhd(rbd_file, vhd_file, vhd_uuid, verbose)
             pass
     else:
-            print "Usage:"
-            print '\tvhd2rbd -v <vhd_file> -r <rbd_file>'
-            print '\trbd2vhd -r <rbd_file> -v <vhd_file>'
+            eprint('Usage:')
+            eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
+            eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vdi_uuid>] [-v]')
 
 if __name__ == "__main__":
    main(sys.argv[1:])
