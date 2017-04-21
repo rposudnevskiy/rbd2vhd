@@ -141,6 +141,18 @@ def INFO(v, string):
     if v is True:
         eprint("[INFO]%s" % string)
 
+def MROUTPUT(string):
+    length = len(string)
+    if length>0:
+       print(pack("!8B",0,0,0,0,0,0,0,0),end="")
+       print(pack("!B",length),end="")
+       print(pack("!3B",0,0,0),end="")
+       print(pack("!%ds" % length, string),end="")
+    else:
+       print(pack("!8B",0,0,0,0,0,0,0,0),end="")
+       print(pack("!B",0),end="")
+       print(pack("!3B",0,0,0),end="")
+
 def ERROR(v, string):
     if v is not True:
         eprint("[ERROR]%s" % string)
@@ -308,15 +320,122 @@ def get_raw_byte_offset_of_sector(block_number, sector_in_block, block_size, sec
 def get_raw_sector_offset_of_sector(block_number, sector_in_block, block_size, sector_size):
     sector_per_block = block_size / sector_size
     return block_number*sector_per_block+sector_in_block
-
 #-------------------------------------------------------------------------------------------------------------------------------------------------------#
-def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
+def rbd2raw(rbd, raw, verbose, progress, mrout):
+    RAW_FH = open(raw, "wb")
+    if rbd == "-":
+        RBDDIFF_FH = sys.stdin
+    else:
+        RBDDIFF_FH = open(rbd, "rb")
+        
+    rbd_meta_read_finished = 0
+    _prev_percent_ = 0
+    _offset_ = 0
+    
+    rbd_header = RBDDIFF_FH.read(len(RBD_HEADER))
+    
+    if (progress):
+        if (mrout):
+            MROUTPUT("Progress: 0")
+        else:
+            eprint("Progress: 0")
+    
+    while True:
+        record_tag = RBDDIFF_FH.read(RBD_DIFF_META_RECORD_TAG_SIZE)
+        #record_tag = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_RECORD_TAG), record)
+        if not record_tag:
+            INFO(verbose, "[rbd2raw]: RBD: EOF")
+            break
+        else:
+            INFO(verbose, "[rbd2raw]: RBD Record TAG = \'%c\'" % record_tag)
+            if record_tag == "e":
+                INFO(verbose, "[rbd2raw]: RBD: EOF")
+                break
+            if record_tag == "f":
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SNAP_SIZE)
+                snap_name_length = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SNAP), record)[0])
+                record = RBDDIFF_FH.read(snap_name_length)
+                from_snap_name = unpack("%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, snap_name_length),record)[0]
+                regex = re.compile(SNAPSHOT_PREFIX)
+                from_snap_name = regex.sub('', from_snap_name)
+                INFO(verbose, "[rbd2raw]: RBD: From snap = %s" % from_snap_name)
+            elif record_tag == "t":
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SNAP_SIZE)
+                snap_name_length = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SNAP), record)[0])
+                record = RBDDIFF_FH.read(snap_name_length)
+                to_snap_name = unpack("%s%ds" % (RBD_DIFF_META_ENDIAN_PREFIX, snap_name_length),record)[0]
+                regex = re.compile(SNAPSHOT_PREFIX)
+                to_snap_name = regex.sub('', to_snap_name)
+                INFO(verbose, "[rbd2raw]: RBD: To snap = %s" % to_snap_name)
+            elif record_tag == "s":
+                record = RBDDIFF_FH.read(RBD_DIFF_META_SIZE_SIZE)
+                image_size = int(unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_META_SIZE), record)[0])
+                INFO(verbose, "[rbd2raw]: RBD: Image size = %d" % image_size)
+            elif record_tag == "w":
+                record = RBDDIFF_FH.read(RBD_DIFF_DATA_SIZE)
+                _record_ = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_DATA), record)
+                offset = _record_[0]
+                length = _record_[1]
+                INFO(verbose, "[rbd2raw]: RBD: Data offset = 0x%08x and length = %d" % (offset, length))
+                if rbd_meta_read_finished == 0:
+                    rbd_meta_read_finished = 1
+            elif record_tag == "z":
+                record = RBDDIFF_FH.read(RBD_DIFF_DATA_SIZE)
+                _record_ = unpack("%s%s" % (RBD_DIFF_META_ENDIAN_PREFIX, RBD_DIFF_DATA), record)
+                offset = _record_[0]
+                length = _record_[1]
+                INFO(verbose, "[rbd2raw]: RBD: Zero data offset = 0x%08x and length = %d" % (offset, length))
+                if rbd_meta_read_finished == 0:
+                    rbd_meta_read_finished = 1
+            else:
+                ERROR(verbose, "[rbd2raw]: RBD: Error while reading rbd_diff file")
+                sys.exit(2)
+            
+            if (rbd_meta_read_finished == 1):
+                
+                if record_tag == "w":
+                    _buffer_ = RBDDIFF_FH.read(length)
+                elif record_tag == "z":
+                    _buffer_ = pack("!%ds" % length, '')
+                
+                if (_offset_ == 0):
+                    RAW_FH.seek(offset,1)
+                    _offset_ = offset + length
+                    RAW_FH.write(_buffer_)
+                else:
+                    RAW_FH.seek(offset-_offset_,1)
+                    _offset_ = offset + length
+                    RAW_FH.write(_buffer_)
+                
+                if (progress):
+                    _percent_ = (100*_offset_)//image_size
+                    if _prev_percent_ != _percent_ :
+                        _prev_percent_ = _percent_
+                        if (mrout):
+                            MROUTPUT("Progress: %d" % _percent_)
+                        else:
+                            eprint("Progress: %d" % _percent_)
+    
+    if (progress):
+        if (mrout):
+            MROUTPUT("Progress: 100")
+            MROUTPUT("")
+        else:
+            eprint("Progress: 100")
+    
+    RAW_FH.close
+    if RBDDIFF_FH is not sys.stdin:
+        RBDDIFF_FH.close
+    
+    return 0
+#-------------------------------------------------------------------------------------------------------------------------------------------------------#
+def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose, progress, mrout):
     
     VHD_FH = open(vhd, "wb")
     if rbd == "-":
         RBDDIFF_FH = sys.stdin
     else:
-        RBDDIFF_FH = open(rbd, "rb")    
+        RBDDIFF_FH = open(rbd, "rb")
        
     rbd_header = RBDDIFF_FH.read(len(RBD_HEADER))
     
@@ -328,6 +447,7 @@ def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
     parent_exists = False
     allocated_block_count=0
     last_written_sector_in_block = 0
+    _prev_percent_ = 0
     
     while True:
         record_tag = RBDDIFF_FH.read(RBD_DIFF_META_RECORD_TAG_SIZE)
@@ -484,6 +604,7 @@ def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
                 
             if (rbd_meta_read_finished == 1) & (vhd_headers_written == 1):
                 _offset_ = offset
+                _total_blocks_ = image_size / VHD_DEFAULT_BLOCK_SIZE
                 while length > 0:
                     SectorsPerBlock = VHD_DEFAULT_BLOCK_SIZE / SECTOR_SIZE
                     RawSectorNumber = _offset_ / SECTOR_SIZE
@@ -514,14 +635,14 @@ def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
                         if record_tag == "w":
                             _buffer_ = RBDDIFF_FH.read(length)
                         elif record_tag == "z":
-                            _buffer_ = pack("!$ds" % length, '')
+                            _buffer_ = pack("!%ds" % length, '')
                         read_length = length
                         length = 0
                     else:
                         if record_tag == "w":
                             _buffer_ = RBDDIFF_FH.read((SectorsPerBlock-SectorInBlock)*SECTOR_SIZE)
                         elif record_tag == "z":
-                            _buffer_ = pack("!$ds" % (SectorsPerBlock-SectorInBlock)*SECTOR_SIZE, '')
+                            _buffer_ = pack("!%ds" % ((SectorsPerBlock-SectorInBlock)*SECTOR_SIZE), '')
                         read_length = (SectorsPerBlock-SectorInBlock)*SECTOR_SIZE
                         length = length - read_length
                     
@@ -551,6 +672,15 @@ def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
                     _offset_ += read_length
                     
                     last_written_sector_in_block = SectorInBlock + read_sectors
+                    
+                    if (progress):
+                        _percent_ = (100*BlockNumber)//_total_blocks_
+                        if _prev_percent_ != _percent_ :
+                            _prev_percent_ = _percent_
+                            if (mrout):
+                                MROUTPUT("Progress: %d" % _percent_)
+                            else:
+                                eprint("Progress: %d" % _percent_)
     
     if last_written_sector_in_block != 0:
         INFO(verbose, "[rbd2vhd]: Write %d zero sectors to the end of block" % (SectorsPerBlock - SectorInBlock - read_sectors))
@@ -579,13 +709,22 @@ def rbd2vhd(rbd, vhd, rbd_image_uuid, verbose):
             VHD_FH.write(gen_bitmap_from_bitarray(blocks_bitmaps[BlockNumber]))
             vhd_file_offset += block_bitmap_size
     
+    if (progress):
+        if (mrout):
+            MROUTPUT("Progress: 100")
+            MROUTPUT("")
+        else:
+            eprint("Progress: 100")
+            
     VHD_FH.close
     if RBDDIFF_FH is not sys.stdin:
         RBDDIFF_FH.close
     
     return 0
 #-------------------------------------------------------------------------------------------------------------------------------------------------------#
-def vhd2rbd(vhd, rbd, verbose):
+def vhd2rbd(vhd, rbd, verbose, progress, mrout):
+    
+    _prev_percent_ = 0
     
     VHD_FH = open(vhd, "rb")
     if rbd == "-":
@@ -679,7 +818,22 @@ def vhd2rbd(vhd, rbd, verbose):
                 raw_last_sector = -1
                 in_block_first_sector = -1
                 in_block_last_sector = -1
+        
+        if (progress):
+            _percent_ = (100*block_index)//DYNAMIC_DISK_HEADER[_dynamic_disk_header_max_table_entries_]
+            if _prev_percent_ != _percent_ :
+                _prev_percent_ = _percent_
+                if (mrout):
+                    MROUTPUT("Progress: %d" % _percent_)
+                else:
+                    eprint("Progress: %d" % _percent_)
     
+    if (progress):
+        if (mrout):
+            MROUTPUT("Progress: 100")
+        else:
+            eprint("Progress: 100")
+            
     INFO(verbose, "[vhd2rbd]: Total wrintten sectors : %d" % total_changed_sectors)
     INFO(verbose, "[vhd2rbd]: Total written bytes: %d" % (total_changed_sectors*512))
     
@@ -705,38 +859,49 @@ def main(argv):
     
     if len(sys.argv) > 1:
         try:
-            opts, args = getopt.getopt(argv,"hv",["vhd=","rbd=","uuid="])
+            opts, args = getopt.getopt(argv,"hvpm",["vhd=","rbd=","raw=","uuid="])
         except getopt.GetoptError:
             eprint('Usage:')
             eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
             eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-v]')
+            eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-v]')
             sys.exit(2)
         for opt, arg in opts:
             if opt == '-h':
                 eprint('Usage:')
                 eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
                 eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-v]')
+                eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-v]')
                 sys.exit()
             if opt == '-v':
                 verbose = True
+            if opt == '-p':
+                progress = True
+            if opt == '-m':
+                mrout = True
             elif opt == '--vhd':
                 vhd_file = arg
+                INFO(verbose, "[main]: VHD file is \'%s\'" % vhd_file)
             elif opt == '--rbd':
                 rbd_file = arg
+                INFO(verbose, "[main]: RBD file is \'%s\'" % rbd_file)
+            elif opt == '--raw':
+                raw_file = arg
+                INFO(verbose, "[main]: RAW file is \'%s\'" % raw_file)
             elif opt == '--uuid':
                 vhd_uuid = arg
-        INFO(verbose, "[main]: VHD file is \'%s\'" % vhd_file)
-        INFO(verbose, "[main]: RBD file is \'%s\'" % rbd_file)
         
         if (cmdname == 'vhd2rbd'):
-            vhd2rbd(vhd_file, rbd_file, verbose)
+            vhd2rbd(vhd_file, rbd_file, verbose, progress, mrout)
         elif(cmdname == 'rbd2vhd'):
-            rbd2vhd(rbd_file, vhd_file, vhd_uuid, verbose)
-            pass
+            rbd2vhd(rbd_file, vhd_file, vhd_uuid, verbose, progress, mrout)
+        elif(cmdname == 'rbd2raw'):
+            rbd2raw(rbd_file, raw_file, verbose, progress, mrout)
     else:
             eprint('Usage:')
             eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-v]')
             eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vdi_uuid>] [-v]')
+            eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-v]')
 
 if __name__ == "__main__":
    main(sys.argv[1:])
