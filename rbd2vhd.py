@@ -25,6 +25,9 @@ import socket
 import select
 import threading
 
+verbose = False
+debug = False
+
 SECTOR_SIZE = 512
 VHD_DEFAULT_BLOCK_SIZE = 2097152
 VHD_DYNAMIC_HARDDISK_TYPE = 0x00000003# Dynamic hard disk
@@ -226,7 +229,7 @@ def INFO(string):
 
 def DEBUG(string):
     calling_func = sys._getframe(1).f_code.co_name
-    if verbose is True:
+    if debug is True:
         eprint("[DEBUG][%s]: %s" % (calling_func, string))
 
 def ERROR(string):
@@ -715,6 +718,8 @@ def rbd2nbd(rbd, uri, progress, mrout):
                 request_handles_lock.release()
                 handle_index+=1
                 _offset_ = offset + length
+
+                #time.sleep(0.05)
 
                 if (progress):
                     _percent_ = (100*_offset_)//image_size
@@ -1305,8 +1310,10 @@ def main(argv):
                 eprint('\trbd2nbd --rbd <rbd_file> --nbd <nbd_server> [-p] [-m] [-v] [-d]')
                 sys.exit()
             elif opt == '-v':
+                global verbose
                 verbose = True
             elif opt == '-d':
+                global debug
                 debug = True
             elif opt == '-p':
                 progress = True
@@ -1343,6 +1350,4 @@ def main(argv):
             eprint('\trbd2nbd --rbd <rbd_file> --nbd <nbd_server> [-p] [-m] [-v] [-d]')
 
 if __name__ == "__main__":
-    verbose = False
-    debug = False
     main(sys.argv[1:])
