@@ -1287,7 +1287,7 @@ def main(argv):
             eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-p] [-m] [-v] [-d]')
             eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-p] [-m] [-v] [-d]')
             eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-p] [-m] [-v] [-d]')
-            eprint('\trbd2nbd --rbd <rbd_file> --nbd <vhd_file> [-p] [-m] [-v] [-d]')
+            eprint('\trbd2nbd --rbd <rbd_file> --nbd <nbd_server> [-p] [-m] [-v] [-d]')
             sys.exit(2)
 
         vhd_file = ''
@@ -1302,7 +1302,7 @@ def main(argv):
                 eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-p] [-m] [-v] [-d]')
                 eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [--uuid <vhd_uuid>] [-p] [-m] [-v] [-d]')
                 eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-p] [-m] [-v] [-d]')
-                eprint('\trbd2nbd --rbd <rbd_file> --nbd <vhd_file> [-p] [-m] [-v] [-d]')
+                eprint('\trbd2nbd --rbd <rbd_file> --nbd <nbd_server> [-p] [-m] [-v] [-d]')
                 sys.exit()
             elif opt == '-v':
                 verbose = True
@@ -1340,7 +1340,7 @@ def main(argv):
             eprint('\tvhd2rbd --vhd <vhd_file> --rbd <rbd_file> [-p] [-m] [-v] [-d]')
             eprint('\trbd2vhd --rbd <rbd_file> --vhd <vhd_file> [-p] [-m] [--uuid <vdi_uuid>] [-v] [-d]')
             eprint('\trbd2raw --rbd <rbd_file> --raw <vhd_file> [-p] [-m] [-v] [-d]')
-            eprint('\trbd2nbd --rbd <rbd_file> --nbd <vhd_file> [-p] [-m] [-v] [-d]')
+            eprint('\trbd2nbd --rbd <rbd_file> --nbd <nbd_server> [-p] [-m] [-v] [-d]')
 
 if __name__ == "__main__":
     verbose = False
